@@ -1,8 +1,11 @@
 import json
+import logging
 import sys
 from contextlib import AbstractContextManager
+from functools import wraps, partial
 from pathlib import PurePath
 from platform import platform
+import threading
 
 import click
 import polling2
@@ -30,9 +33,21 @@ class RossumException(click.ClickException):
     pass
 
 
+def run_in_thread(f: Callable) -> Callable:
+    @wraps(f)
+    def create_thread(*args, **kwargs):
+        t = threading.Thread(target=f, args=args, kwargs=kwargs, daemon=True)
+        t.start()
+        # t.join()
+        # return f(*args, **kwargs)
+    # TODO: this decorator is probably wrong
+    return create_thread
+
+
 RequestsFiles = Dict[str, Tuple[Optional[str], Union[IO[bytes], BinaryIO, str]]]
 
 HEADERS = {"User-Agent": f"rossum/{__version__} ({platform()})"}
+log = logging.getLogger(__name__)
 
 
 class APIClient(AbstractContextManager):
@@ -56,6 +71,8 @@ class APIClient(AbstractContextManager):
 
         self.token: Optional[str] = None
         self.timeout: Optional[float] = None
+        self.request_wait_time_s: float = 2
+        self.request_max_retries: int = 3
 
     def __exit__(self, exc_type, exc_value, traceback) -> None:
         self.logout()
@@ -91,6 +108,7 @@ class APIClient(AbstractContextManager):
         if self._max_token_lifetime:
             login_data["max_token_lifetime_s"] = self._max_token_lifetime
         response = requests.post(f"{self.url}/auth/login", json=login_data, headers=HEADERS)
+        # TODO: polling must be applied above, too
         if response.status_code == 401:
             raise RossumException(f"Login failed with the provided credentials.")
         elif not response.ok:
@@ -128,7 +146,7 @@ class APIClient(AbstractContextManager):
     def _do_request(self, method: str, url: str, query: dict = None, **kwargs) -> Response:
         auth = self._authentication
         headers = {**HEADERS, **auth.pop("headers", {}), **kwargs.pop("headers", {})}
-        response = requests.request(
+        return requests.request(
             method,
             url,
             params=_encode_booleans(query),
@@ -137,12 +155,34 @@ class APIClient(AbstractContextManager):
             **auth,
             **kwargs,
         )
-        return response
+
+    @run_in_thread
+    def poll_rossum_endpoint(
+        self, method: str, url: str, query: dict, **kwargs
+    ):
+        poll_function = partial(self._do_request, method, url, query, **kwargs)
+        try:
+            polling2.poll(
+                poll_function,
+                check_success=lambda rsp: rsp.ok,
+                step=self.request_wait_time_s,
+                step_function=polling2.step_constant,
+                max_tries=self.request_max_retries,
+                timeout=self.timeout,
+                ignore_exceptions=(requests.RequestException,),
+                log=logging.INFO,
+                log_error=logging.WARNING,
+            )
+        except polling2.MaxCallException:
+            click.echo("MAX CALL EXCEPTION")
+            raise
 
     def _request_url(
         self, method: str, url: str, query: dict = None, expected_status_code: int = 200, **kwargs
     ) -> Response:
-        response = self._do_request(method, url, query, **kwargs)
+        # response = self._do_request(method, url, query, **kwargs)
+        response = self.poll_rossum_endpoint(method, url, query, **kwargs)
+        click.echo(response)
         if response.status_code != expected_status_code:
             raise RossumException(f"Invalid response [{response.url}]: {response.text}")
         return response
